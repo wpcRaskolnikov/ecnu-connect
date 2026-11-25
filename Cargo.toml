@@ -2,6 +2,8 @@
 name = "ecnu-connect"
 version = "0.1.0"
 edition = "2024"
+authors = ["wpcRaskolnikov <22pcwang@stu.ecnu.edu.cn>"]
+repository = "https://github.com/wpcRaskolnikov/ecnu-connect.git"
 
 [dependencies]
 anyhow = "1.0.105"
