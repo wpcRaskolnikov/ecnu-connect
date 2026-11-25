@@ -2,8 +2,27 @@
 name = "ecnu-connect"
 version = "0.1.0"
 edition = "2024"
+description = "Command-line client for the ECNU campus VPN"
 authors = ["wpcRaskolnikov <22pcwang@stu.ecnu.edu.cn>"]
 repository = "https://github.com/wpcRaskolnikov/ecnu-connect.git"
+
+[package.metadata.binstall]
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.wix]
+upgrade-guid = "F4D274B1-8058-4CE2-92C0-229F58522C19"
+path-guid = "3367B3C9-5452-4259-8391-C2F423B48C71"
+license = false
+eula = false
+
+[features]
+bundled-core = ["dep:sha2", "dep:ureq", "dep:zip"]
+
+[build-dependencies]
+anyhow = "1.0.105"
+sha2 = { version = "0.11", optional = true }
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
 
 [dependencies]
 anyhow = "1.0.105"

@@ -1,3 +1,4 @@
+#[cfg(not(feature = "bundled-core"))]
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -10,28 +11,81 @@ use anyhow::{Context, Result, ensure};
 use crate::cas::{Callback, LOGIN_DOMAIN, VPN_HOST, VPN_PORT};
 use crate::executable;
 
-fn find_core() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ECNU_ZJU_CONNECT") {
-        return executable::find(&path).context("找不到 ECNU_ZJU_CONNECT 指定的可执行文件");
+pub struct Core {
+    command: Command,
+    #[cfg(feature = "bundled-core")]
+    _temp_dir: Option<tempfile::TempDir>,
+}
+
+impl Core {
+    fn external(path: PathBuf) -> Self {
+        Self {
+            command: Command::new(path),
+            #[cfg(feature = "bundled-core")]
+            _temp_dir: None,
+        }
+    }
+}
+
+fn find_core() -> Result<Core> {
+    if let Some(path) = std::env::var_os("ZJU_CONNECT") {
+        return executable::find(&path)
+            .map(Core::external)
+            .context("找不到 ZJU_CONNECT 指定的可执行文件");
     }
 
     let name = format!("zju-connect{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(cli) = std::env::current_exe() {
-        let sibling = cli.with_file_name(&name);
-        if executable::is_executable(&sibling) {
-            return Ok(sibling);
-        }
+    #[cfg(feature = "bundled-core")]
+    {
+        extract_core(&name)
     }
-    executable::find(OsStr::new(&name)).with_context(|| {
-        format!("找不到 {name}；请将它放在 ecnu-connect 同目录、加入 PATH 或设置 ECNU_ZJU_CONNECT")
+    #[cfg(not(feature = "bundled-core"))]
+    {
+        if let Ok(cli) = std::env::current_exe() {
+            let sibling = cli.with_file_name(&name);
+            if executable::is_executable(&sibling) {
+                return Ok(Core::external(sibling));
+            }
+        }
+        executable::find(OsStr::new(&name))
+            .map(Core::external)
+            .with_context(|| {
+                format!(
+                    "找不到 {name}；请将它放在 ecnu-connect 同目录、加入 PATH 或设置 ZJU_CONNECT"
+                )
+            })
+    }
+}
+
+#[cfg(feature = "bundled-core")]
+fn extract_core(name: &str) -> Result<Core> {
+    let dir = tempfile::Builder::new()
+        .prefix("ecnu-connect-core-")
+        .tempdir()
+        .context("无法创建内嵌 zju-connect 的临时目录")?;
+    let path = dir.path().join(name);
+    std::fs::write(
+        &path,
+        include_bytes!(concat!(env!("OUT_DIR"), "/bundled-zju-connect")),
+    )
+    .context("无法提取内嵌 zju-connect")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .context("无法设置内嵌 zju-connect 的执行权限")?;
+    }
+    Ok(Core {
+        command: Command::new(path),
+        _temp_dir: Some(dir),
     })
 }
 
-pub fn command(port: u16, http_port: u16) -> Result<Command> {
+pub fn prepare(port: u16, http_port: u16) -> Result<Core> {
     let socks_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).to_string();
     let http_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, http_port).to_string();
-    let mut command = Command::new(find_core()?);
-    command.args([
+    let mut core = find_core()?;
+    core.command.args([
         "--protocol",
         "atrust",
         "--server",
@@ -47,11 +101,12 @@ pub fn command(port: u16, http_port: u16) -> Result<Command> {
         "--http-bind",
         &http_bind,
     ]);
-    Ok(command)
+    Ok(core)
 }
 
-pub fn run(mut command: Command, callback: Callback) -> Result<()> {
-    let mut child = command
+pub fn run(mut core: Core, callback: Callback) -> Result<()> {
+    let mut child = core
+        .command
         .stdin(Stdio::piped())
         .spawn()
         .context("无法启动 zju-connect")?;

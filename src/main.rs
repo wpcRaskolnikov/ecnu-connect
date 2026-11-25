@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 
 fn login(browser: Option<Browser>, port: u16, http_port: u16) -> Result<()> {
     ensure!(port != http_port, "SOCKS5 和 HTTP 代理不能使用同一个端口");
-    let core = core::command(port, http_port)?;
+    let core = core::prepare(port, http_port)?;
     let callback = browser::capture(browser)?;
     eprintln!("已收到 CAS 回调，正在启动 zju-connect。");
     core::run(core, callback)

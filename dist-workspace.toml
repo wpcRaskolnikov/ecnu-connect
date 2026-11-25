@@ -7,6 +7,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.34.0"
 # CI backends to support
 ci = "github"
+# Release binaries embed the target-specific core prepared by build.rs.
+features = ["bundled-core"]
 # The installers to generate for each app
 installers = ["shell", "msi"]
 # Target platforms to build apps for (Rust target-triple syntax)
