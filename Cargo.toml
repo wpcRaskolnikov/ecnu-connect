@@ -1,6 +1,6 @@
 [package]
 name = "ecnu-connect"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Command-line client for the ECNU campus VPN"
 authors = ["wpcRaskolnikov <22pcwang@stu.ecnu.edu.cn>"]
