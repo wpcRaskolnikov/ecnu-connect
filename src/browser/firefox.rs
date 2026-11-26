@@ -1,7 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -10,8 +9,7 @@ use serde_json::{Value, json};
 use crate::cas::{CALLBACK_PATH, Callback, VPN_ENTRY, VPN_HOST};
 
 use super::{
-    DebugSocket, LOGIN_TIMEOUT, STARTUP_TIMEOUT, close_browser, connect, prompt_login, receive,
-    send, wait_for_endpoint,
+    DebugSocket, connect, poll_events, process::BrowserProcess, prompt_login, receive, send,
 };
 
 pub(super) fn callback(bin: &Path) -> Result<Callback> {
@@ -25,27 +23,18 @@ pub(super) fn callback(bin: &Path) -> Result<Callback> {
         .prefix("ecnu-connect-firefox-")
         .tempdir_in(profile_root)
         .context("无法创建 Firefox 临时配置")?;
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(["--no-remote", "--profile"])
         .arg(profile.path())
-        .args(["--remote-debugging-port", "0", "about:blank"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("无法启动浏览器")?;
-    let result = wait_for_endpoint(
-        &profile.path().join("WebDriverBiDiServer.json"),
-        &mut child,
-        |text| {
-            serde_json::from_str::<FirefoxEndpoint>(text)
-                .ok()
-                .map(FirefoxEndpoint::loopback)
-        },
-    )
-    .and_then(connect_and_capture);
-    close_browser(&mut child);
-    result
+        .args(["--remote-debugging-port", "0", "about:blank"]);
+    let mut browser = BrowserProcess::spawn(command, profile)?;
+    let endpoint = browser.wait_for_endpoint("WebDriverBiDiServer.json", |text| {
+        serde_json::from_str::<FirefoxEndpoint>(text)
+            .ok()
+            .map(FirefoxEndpoint::loopback)
+    })?;
+    connect_and_capture(endpoint)
 }
 
 #[derive(Deserialize)]
@@ -74,9 +63,49 @@ fn connect_and_capture(endpoint: SocketAddr) -> Result<Callback> {
         socket: connect(endpoint, "/session")?,
         id: 0,
     };
-    let result = bidi.capture();
+    let result = wait_for_callback(&mut bidi);
     let _ = bidi.send("browser.close", json!({}));
     result
+}
+
+fn wait_for_callback(bidi: &mut BiDi) -> Result<Callback> {
+    bidi.call("session.new", json!({"capabilities": {}}))?;
+    let tab = bidi.call("browsingContext.create", json!({"type":"tab"}))?;
+    let context = tab["context"]
+        .as_str()
+        .context("Firefox 未返回登录标签页 ID")?;
+    bidi.call(
+        "session.subscribe",
+        json!({"events":["network.beforeRequestSent"],"contexts":[context]}),
+    )?;
+    bidi.call("network.addIntercept", json!({
+        "phases":["beforeRequestSent"], "contexts":[context],
+        "urlPatterns":[{"type":"pattern","protocol":"https","hostname":VPN_HOST,"pathname":CALLBACK_PATH}]
+    }))?;
+    let navigation = bidi.send(
+        "browsingContext.navigate",
+        json!({"context":context,"url":VPN_ENTRY,"wait":"none"}),
+    )?;
+    prompt_login();
+    let event = poll_events(&mut bidi.socket, |event| {
+        if event["id"].as_u64() == Some(navigation) && event["type"] != "success" {
+            bail!("Firefox 无法打开 ECNU VPN 登录入口");
+        }
+        let params = &event["params"];
+        Ok(event["method"] == "network.beforeRequestSent"
+            && params["context"].as_str() == Some(context)
+            && params["isBlocked"].as_bool() == Some(true))
+    })?;
+    let request = &event["params"]["request"];
+    let id = request["request"]
+        .as_str()
+        .context("Firefox 未返回回调请求 ID")?;
+    let callback = request["url"]
+        .as_str()
+        .context("Firefox 未返回回调地址")
+        .and_then(|url| Callback::parse(url, request["method"].as_str()));
+    bidi.call("network.failRequest", json!({"request":id}))?;
+    callback.context("Firefox 已拦截无效的 CAS 回调，未转发")
 }
 
 struct BiDi {
@@ -85,63 +114,6 @@ struct BiDi {
 }
 
 impl BiDi {
-    fn capture(&mut self) -> Result<Callback> {
-        self.call("session.new", json!({"capabilities": {}}))?;
-        let tab = self.call("browsingContext.create", json!({"type":"tab"}))?;
-        let context = tab["context"]
-            .as_str()
-            .context("Firefox 未返回登录标签页 ID")?;
-        self.call(
-            "session.subscribe",
-            json!({"events":["network.beforeRequestSent"],"contexts":[context]}),
-        )?;
-        self.call("network.addIntercept", json!({
-            "phases":["beforeRequestSent"], "contexts":[context],
-            "urlPatterns":[{"type":"pattern","protocol":"https","hostname":VPN_HOST,"pathname":CALLBACK_PATH}]
-        }))?;
-        let navigation = self.send(
-            "browsingContext.navigate",
-            json!({"context":context,"url":VPN_ENTRY,"wait":"none"}),
-        )?;
-        prompt_login();
-        let deadline = Instant::now() + LOGIN_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!("等待 Firefox 登录回调超时");
-            }
-            self.socket
-                .get_ref()
-                .set_read_timeout(Some(remaining))
-                .context("无法设置 Firefox 登录超时")?;
-            let event = receive(&mut self.socket)?;
-            if event["id"].as_u64() == Some(navigation) && event["type"] != "success" {
-                bail!("Firefox 无法打开 ECNU VPN 登录入口");
-            }
-            let params = &event["params"];
-            if event["method"] != "network.beforeRequestSent"
-                || params["context"].as_str() != Some(context)
-                || params["isBlocked"].as_bool() != Some(true)
-            {
-                continue;
-            }
-            let request = &params["request"];
-            let id = request["request"]
-                .as_str()
-                .context("Firefox 未返回回调请求 ID")?;
-            let callback = request["url"]
-                .as_str()
-                .context("Firefox 未返回回调地址")
-                .and_then(|url| Callback::parse(url, request["method"].as_str()));
-            self.socket
-                .get_ref()
-                .set_read_timeout(Some(STARTUP_TIMEOUT))
-                .context("无法设置 Firefox 读取超时")?;
-            self.call("network.failRequest", json!({"request":id}))?;
-            return callback.context("Firefox 已拦截无效的 CAS 回调，未转发");
-        }
-    }
-
     fn send(&mut self, method: &str, params: Value) -> Result<u64> {
         self.id += 1;
         let message = json!({"id":self.id,"method":method,"params":params});

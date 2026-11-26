@@ -1,8 +1,7 @@
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -10,8 +9,7 @@ use serde_json::{Value, json};
 use crate::cas::{CALLBACK_PATH, Callback, VPN_ENTRY, VPN_HOST};
 
 use super::{
-    DebugSocket, LOGIN_TIMEOUT, STARTUP_TIMEOUT, close_browser, connect, prompt_login, receive,
-    send, wait_for_endpoint,
+    DebugSocket, connect, poll_events, process::BrowserProcess, prompt_login, receive, send,
 };
 
 pub(super) fn callback(bin: &Path) -> Result<Callback> {
@@ -21,29 +19,19 @@ pub(super) fn callback(bin: &Path) -> Result<Callback> {
         .context("无法创建临时浏览器配置")?;
     let mut profile_arg = OsString::from("--user-data-dir=");
     profile_arg.push(profile.path());
-    let mut child = Command::new(bin)
-        .arg(profile_arg)
-        .args([
-            "--no-startup-window",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--remote-debugging-address=127.0.0.1",
-            "--remote-debugging-port=0",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("无法启动浏览器")?;
-
-    let result = wait_for_endpoint(
-        &profile.path().join("DevToolsActivePort"),
-        &mut child,
-        |text| parse_chromium_endpoint(text).map(|(port, path)| Ok((port, path.to_owned()))),
-    )
-    .and_then(|(port, path)| connect_and_capture(port, &path));
-    close_browser(&mut child);
-    result
+    let mut command = Command::new(bin);
+    command.arg(profile_arg).args([
+        "--no-startup-window",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-debugging-port=0",
+    ]);
+    let mut browser = BrowserProcess::spawn(command, profile)?;
+    let (port, path) = browser.wait_for_endpoint("DevToolsActivePort", |text| {
+        parse_chromium_endpoint(text).map(|(port, path)| Ok((port, path.to_owned())))
+    })?;
+    connect_and_capture(port, &path)
 }
 
 fn parse_chromium_endpoint(text: &str) -> Option<(u16, &str)> {
@@ -87,47 +75,32 @@ fn wait_for_callback(cdp: &mut ChromiumCdp) -> Result<Callback> {
     cdp.call("Fetch.enable", json!({"patterns":[{"urlPattern":pattern,"resourceType":"Document","requestStage":"Request"}]}), Some(session))?;
     let nav = cdp.send("Page.navigate", json!({"url":VPN_ENTRY}), Some(session))?;
     prompt_login();
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("等待浏览器登录回调超时");
-        }
-        cdp.socket
-            .get_ref()
-            .set_read_timeout(Some(remaining))
-            .context("无法设置登录超时")?;
-        let event = receive(&mut cdp.socket)?;
-        if event["id"].as_u64() == Some(nav)
-            && (event.get("error").is_some() || event["result"].get("errorText").is_some())
-        {
-            bail!("浏览器无法打开 ECNU VPN 登录入口");
-        }
-        if event["sessionId"].as_str() != Some(session) || event["method"] != "Fetch.requestPaused"
-        {
-            continue;
-        }
-        let params = &event["params"];
-        let id = params["requestId"]
-            .as_str()
-            .context("浏览器未返回回调请求 ID")?;
-        let request = &params["request"];
-        let callback = request["url"]
-            .as_str()
-            .context("浏览器未返回回调地址")
-            .and_then(|url| Callback::parse(url, request["method"].as_str()));
-        cdp.socket
-            .get_ref()
-            .set_read_timeout(Some(STARTUP_TIMEOUT))
-            .context("无法设置浏览器读取超时")?;
-        // Abort at the request stage; only zju-connect should redeem this ticket.
-        cdp.call(
-            "Fetch.failRequest",
-            json!({"requestId":id,"errorReason":"Aborted"}),
-            Some(session),
-        )?;
-        return callback.context("已拦截无效的 CAS 回调，未转发");
-    }
+    let event =
+        poll_events(&mut cdp.socket, |event| {
+            if event["id"].as_u64() == Some(nav)
+                && (event.get("error").is_some() || event["result"].get("errorText").is_some())
+            {
+                bail!("浏览器无法打开 ECNU VPN 登录入口");
+            }
+            Ok(event["sessionId"].as_str() == Some(session)
+                && event["method"] == "Fetch.requestPaused")
+        })?;
+    let params = &event["params"];
+    let id = params["requestId"]
+        .as_str()
+        .context("浏览器未返回回调请求 ID")?;
+    let request = &params["request"];
+    let callback = request["url"]
+        .as_str()
+        .context("浏览器未返回回调地址")
+        .and_then(|url| Callback::parse(url, request["method"].as_str()));
+    // Abort at the request stage; only zju-connect should redeem this ticket.
+    cdp.call(
+        "Fetch.failRequest",
+        json!({"requestId":id,"errorReason":"Aborted"}),
+        Some(session),
+    )?;
+    callback.context("已拦截无效的 CAS 回调，未转发")
 }
 
 struct ChromiumCdp {

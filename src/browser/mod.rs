@@ -1,12 +1,11 @@
 mod chromium;
 mod firefox;
+mod process;
 
 use std::ffi::OsStr;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::thread;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -139,30 +138,6 @@ pub fn capture(preferred: Option<Browser>) -> Result<Callback> {
     .with_context(|| format!("{} 登录失败", browser.name()))
 }
 
-fn wait_for_endpoint<T>(
-    file: &Path,
-    child: &mut Child,
-    parse: impl Fn(&str) -> Option<Result<T>>,
-) -> Result<T> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().context("无法检查浏览器进程")? {
-            bail!("浏览器已退出（{status}），未启动调试接口；请确认已进入图形会话");
-        }
-        match std::fs::read_to_string(file) {
-            Ok(contents) => {
-                if let Some(endpoint) = parse(&contents) {
-                    return endpoint;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("无法读取浏览器调试地址文件"),
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    bail!("等待浏览器调试接口超时；请确认浏览器版本支持登录拦截")
-}
-
 fn connect(endpoint: SocketAddr, path: &str) -> Result<DebugSocket> {
     ensure!(
         endpoint.ip().is_loopback(),
@@ -213,13 +188,34 @@ fn receive(socket: &mut DebugSocket) -> Result<Value> {
     }
 }
 
-fn close_browser(child: &mut Child) {
-    let until = Instant::now() + Duration::from_secs(1);
-    while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
-        thread::sleep(Duration::from_millis(25));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+fn poll_events(
+    socket: &mut DebugSocket,
+    mut matches_event: impl FnMut(&Value) -> Result<bool>,
+) -> Result<Value> {
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    let result = (|| {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("等待浏览器登录回调超时");
+            }
+            socket
+                .get_ref()
+                .set_read_timeout(Some(remaining))
+                .context("无法设置登录超时")?;
+            let event = receive(socket)?;
+            if matches_event(&event)? {
+                return Ok(event);
+            }
+        }
+    })();
+    let restore_timeout = socket
+        .get_ref()
+        .set_read_timeout(Some(STARTUP_TIMEOUT))
+        .context("无法设置浏览器读取超时");
+    let event = result?;
+    restore_timeout?;
+    Ok(event)
 }
 
 fn prompt_login() {
