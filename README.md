@@ -35,3 +35,59 @@ ecnu-connect --help
 `--browser` 接受 `chrome`、`edge` 或 `firefox`；`--port` 指定 SOCKS5 端口，`--http-port` 指定 HTTP 端口，两者不能相同。
 
 如果 Chrome 安装在非标准位置，可以设置 `ECNU_CHROME` 指定其可执行文件路径。
+
+### 搭配 Clash 使用
+
+`ecnu-connect` 可以和同一台电脑上的 Clash / Mihomo 配合使用。下面是一份以 Mihomo 为例的分流配置：VPN 网关和登录流量直连，指定的校园网段走本机 SOCKS5，其余流量直连。
+
+```yaml
+mode: rule
+find-process-mode: strict
+
+proxies:
+  - name: ECNU
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    udp: false
+
+rules:
+  - PROCESS-NAME,zju-connect,DIRECT
+  - PROCESS-NAME,zju-connect.exe,DIRECT
+  - DOMAIN,vpn.ecnu.edu.cn,DIRECT
+  - DOMAIN,sso.ecnu.edu.cn,DIRECT
+
+  # 只把需要通过 VPN 访问的资源交给 ECNU 节点。
+  - IP-CIDR,219.123.1.0/24,ECNU,no-resolve
+  - MATCH,DIRECT
+```
+
+如果使用 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)，也可以在「订阅 → 全局扩展脚本」里加入上面的节点和分流规则，不用逐个修改订阅的 YAML。
+
+在规则模式下，命中校园网规则的流量会自动走本机 `ECNU` 节点，日常流量仍按订阅原有的规则分流，不用来回切换节点。下面的脚本会把新增规则放在订阅规则之前，并保留原有的 `MATCH`。
+
+```js
+function main(config) {
+  const name = "ECNU";
+  const proxy = {
+    name,
+    type: "socks5",
+    server: "127.0.0.1",
+    port: 1080,
+    udp: false,
+  };
+  const rules = [
+    "PROCESS-NAME,zju-connect,DIRECT",
+    "PROCESS-NAME,zju-connect.exe,DIRECT",
+    "DOMAIN,vpn.ecnu.edu.cn,DIRECT",
+    "DOMAIN,sso.ecnu.edu.cn,DIRECT",
+    `IP-CIDR,219.123.1.0/24,${name},no-resolve`,
+  ];
+
+  config.proxies = [...(config.proxies ?? []).filter(node => node.name !== name), proxy];
+  config.rules = [...rules, ...(config.rules ?? []).filter(rule => !rules.includes(rule))];
+  return config;
+}
+```
+
+脚本会替换同名的 `ECNU` 节点；如果订阅里已有同名节点且想保留它，请改用其他名称。保存后重新应用订阅并切换到规则模式。
